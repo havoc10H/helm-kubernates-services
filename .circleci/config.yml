@@ -1,0 +1,162 @@
+defaults: &defaults
+  machine:
+    enabled: true
+    image: "ubuntu-1604:201903-01"
+  environment:
+    GRUNTWORK_INSTALLER_VERSION: v0.0.21
+    TERRATEST_LOG_PARSER_VERSION: v0.13.13
+    HELM_VERSION: v2.12.2
+    MODULE_CI_VERSION: v0.16.0
+    TERRAFORM_VERSION: NONE
+    TERRAGRUNT_VERSION: NONE
+    PACKER_VERSION: NONE
+    GOLANG_VERSION: 1.13
+    KUBECONFIG: /home/circleci/.kube/config
+
+
+install_helm_client: &install_helm_client
+  name: install helm
+  command: |
+    # install helm
+    curl -Lo helm.tar.gz https://storage.googleapis.com/kubernetes-helm/helm-${HELM_VERSION}-linux-amd64.tar.gz
+    tar -xvf helm.tar.gz
+    chmod +x linux-amd64/helm
+    sudo mv linux-amd64/helm /usr/local/bin/
+
+
+install_gruntwork_utils: &install_gruntwork_utils
+  name: install gruntwork utils
+  command: |
+    curl -Ls https://raw.githubusercontent.com/gruntwork-io/gruntwork-installer/master/bootstrap-gruntwork-installer.sh | bash /dev/stdin --version "${GRUNTWORK_INSTALLER_VERSION}"
+    gruntwork-install --module-name "gruntwork-module-circleci-helpers" --repo "https://github.com/gruntwork-io/module-ci" --tag "${MODULE_CI_VERSION}"
+    gruntwork-install --module-name "kubernetes-circleci-helpers" --repo "https://github.com/gruntwork-io/module-ci" --tag "${MODULE_CI_VERSION}"
+    gruntwork-install --binary-name "terratest_log_parser" --repo "https://github.com/gruntwork-io/terratest" --tag "${TERRATEST_LOG_PARSER_VERSION}"
+    configure-environment-for-gruntwork-module \
+      --terraform-version ${TERRAFORM_VERSION} \
+      --terragrunt-version ${TERRAGRUNT_VERSION} \
+      --packer-version ${PACKER_VERSION} \
+      --go-version ${GOLANG_VERSION} \
+
+
+version: 2
+jobs:
+  setup:
+    <<: *defaults
+    steps:
+      - checkout
+
+      # Install gruntwork utilities
+      - run:
+          <<: *install_gruntwork_utils
+
+      - run:
+          <<: *install_helm_client
+
+      # Fail the build if the pre-commit hooks don't pass. Note: if you run pre-commit install locally, these hooks will
+      # execute automatically every time before you commit, ensuring the build never fails at this step!
+      - run: pip install pre-commit==1.11.2
+      - run: pre-commit install
+      - run: pre-commit run --all-files
+
+      - persist_to_workspace:
+          root: /home/circleci
+          paths:
+            - project
+
+  test:
+    <<: *defaults
+    steps:
+      - attach_workspace:
+          at: /home/circleci
+
+      - run:
+          <<: *install_gruntwork_utils
+
+      - run:
+          command: setup-minikube
+
+      - run:
+          <<: *install_helm_client
+
+      - run:
+          name: deploy tiller
+          command: helm init --wait
+
+      - run:
+          name: run tests
+          command: |
+            mkdir -p /tmp/logs
+            cd test
+            go mod tidy
+            run-go-tests --packages "-tags all ." --timeout 60m | tee /tmp/logs/all.log
+          no_output_timeout: 3600s
+
+      - run:
+          command: terratest_log_parser --testlog /tmp/logs/all.log --outputdir /tmp/logs
+          when: always
+      - store_artifacts:
+          path: /tmp/logs
+      - store_test_results:
+          path: /tmp/logs
+
+  deploy:
+    <<: *defaults
+    steps:
+      - attach_workspace:
+          at: /home/circleci
+
+      - run:
+          <<: *install_gruntwork_utils
+
+      - run:
+          <<: *install_helm_client
+
+      - run:
+          name: Generate chart packages
+          command: |
+            mkdir -p assets
+            assets_dir="$(python -c "import os; print(os.path.abspath('./assets'))")"
+            version_tag="$(echo "$CIRCLE_TAG" | sed "s/^v?//")"
+            for chart in charts/*/; do
+              chart_name="$(basename "$chart")"
+              echo "Packaging chart ${chart_name}"
+              # Update version tag
+              sed -i "s/0.0.1-replace/${version_tag}/" "${chart}/Chart.yaml"
+              # TODO: Figure out provenance strategy
+              (cd "charts" && helm package "${chart_name}" -d "${assets_dir}" --save=false)
+            done
+
+      - run:
+          name: Generate chart repo index
+          command: |
+            cd assets
+            helm repo index --url "https://github.com/gruntwork-io/helm-kubernetes-services/releases/download/${CIRCLE_TAG}" .
+
+      - run:
+          command: upload-github-release-assets ./assets/*
+
+
+workflows:
+  version: 2
+  test-and-deploy:
+    jobs:
+    - setup:
+        filters:
+          tags:
+            only: /^v.*/
+
+    - test:
+        requires:
+          - setup
+        filters:
+          tags:
+            only: /^v.*/
+
+    - deploy:
+        requires:
+          - test
+        filters:
+          tags:
+            only: /^v.*/
+          branches:
+            ignore: /.*/
